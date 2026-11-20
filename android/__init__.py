@@ -17,22 +17,26 @@ NEXT_AD_TIMEOUT = 75
 REWARD_DIALOG_TIMEOUT = 15
 TRANSITION_TIMEOUT = 10
 POLL_INTERVAL = 0.8
+FOREGROUND_GRACE = 8
+HEADER_SCAN_INTERVAL = 1.6
 LIVE_CLOSE_RETRY_DELAY = 3
 LIVE_CLOSE_ATTEMPTS = 2
 
 TOP = (0, 0, 1, 0.24)
 TOP_RIGHT = (0.48, 0, 1, 0.24)
+CLAIM_HEADER = (0.60, 0, 1, 0.15)
 CLOSE_CORNER = (0.73, 0, 1, 0.24)
 DIALOG = (0.07, 0.24, 0.93, 0.80)
 TOMORROW_HEADER = (0.07, 0.46, 0.93, 0.66)
 TOMORROW_ACTION = (0.07, 0.73, 0.93, 0.92)
 
 SPLASH_SKIP = r"(?:\d+[秒sS]?)?跳过(?:广告)?(?:\d+[秒sS]?)?"
+CLOSE_GLYPHS = "×✕✖✗✘Xx"
 COUNTDOWN = (
     r"(?:再看|再观看|观看|还需|剩余)?\d+(?:秒|[sS])"
-    r"(?:后)?(?:即可|可)?领(?:取)?(?:奖励|听歌时长)"
+    rf"(?:后)?(?:即可|可)?领(?:取)?(?:奖励|听歌时长)[{CLOSE_GLYPHS}]?"
 )
-CLAIM_READY = r"领取成功[×✕✖Xx]?"
+CLAIM_READY = rf"领取成功[{CLOSE_GLYPHS}]?"
 CLAIM_BUTTON = r"领取奖励"
 LIVE_ROOM = r"更多直播"
 LIVE_CLOSE = r"(?:关闭(?:直播(?:间)?)?|退出直播(?:间)?|[×✕✖Xx])"
@@ -46,7 +50,7 @@ class StopRun(Exception):
 
 
 def log(message):
-    print(f"[{time.strftime('%H:%M:%S')}] {message}")
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
 
 
 def foreground_package():
@@ -60,11 +64,20 @@ def require_player():
 
 
 def wait_frames(timeout):
-    """每次轮询只做一次 OCR，所有判断使用同一帧。"""
+    """汽水音乐短暂切出时暂停识别，返回后重新读屏。"""
     deadline = time.monotonic() + timeout
+    away_since = None
     while time.monotonic() < deadline:
-        require_player()
-        yield ScreenText()
+        if foreground_package() == APP_PACKAGE:
+            if away_since is not None:
+                log("汽水音乐已回到前台，继续识别。")
+                away_since = None
+            yield ScreenText()
+        elif away_since is None:
+            away_since = time.monotonic()
+            log(f"汽水音乐暂时不在前台，等待返回（最多 {FOREGROUND_GRACE} 秒）。")
+        elif time.monotonic() - away_since >= FOREGROUND_GRACE:
+            raise StopRun("汽水音乐已离开前台，停止点击。")
         time.sleep(POLL_INTERVAL)
 
 
@@ -84,14 +97,24 @@ class ScreenText:
             and top * self.height <= y < bottom * self.height
         )
 
-    def find(self, pattern, region):
-        for result in self.results:
+    def find(self, pattern, region, results=None):
+        for result in self.results if results is None else results:
             x, y = int(result.center_x), int(result.center_y)
             if self.contains(region, x, y):
                 text = re.sub(r"\s+", "", result.text or "")
                 if re.fullmatch(pattern, text):
                     return x, y
         return None
+
+    def find_claim_in_header(self):
+        # 从屏幕原点裁切顶部，裁切图上的坐标可直接用于点击。
+        results = Ocr.paddleocr(
+            rect=[0, 0, self.width, int(self.height * CLAIM_HEADER[3])],
+            max_side_len=1600,
+        ) or []
+        if self.find(COUNTDOWN, TOP, results):
+            return None
+        return self.find(CLAIM_READY, CLAIM_HEADER, results)
 
 
 def tap(point, label):
@@ -176,6 +199,7 @@ def open_tomorrow_ad(point):
 def wait_for_claim(timeout, allow_tomorrow):
     live_close_attempts = 0
     next_live_close_at = 0
+    next_header_scan_at = 0
     continue_clicked = False
     for frame in wait_frames(timeout):
         resume = find_resume_button(frame)
@@ -189,12 +213,22 @@ def wait_for_claim(timeout, allow_tomorrow):
             continue
         offer_visible, unlock = read_tomorrow_offer(frame)
         if allow_tomorrow and unlock:
-            return None, unlock
+            return None, unlock, None
         if offer_visible:
             continue
         ready = frame.find(CLAIM_READY, TOP_RIGHT)
+        if not ready and time.monotonic() >= next_header_scan_at:
+            next_header_scan_at = time.monotonic() + HEADER_SCAN_INTERVAL
+            if foreground_package() != APP_PACKAGE:
+                continue
+            ready = frame.find_claim_in_header()
+            if ready:
+                log("已通过广告顶部识别到「领取成功」。")
         if ready:
-            return ready, None
+            button = frame.find(CLAIM_BUTTON, DIALOG)
+            if button:
+                return None, None, button
+            return ready, None, None
 
         if time.monotonic() < next_live_close_at or not frame.find(LIVE_ROOM, TOP_RIGHT):
             continue
@@ -206,24 +240,27 @@ def wait_for_claim(timeout, allow_tomorrow):
             tap(close, label)
             live_close_attempts += 1
             next_live_close_at = time.monotonic() + LIVE_CLOSE_RETRY_DELAY
-    return None, None
+    return None, None, None
 
 
-def claim_reward(ready, allow_tomorrow):
+def claim_reward(ready, button, allow_tomorrow):
     """返回本轮是否完成常规领取，以及是否出现明日畅听入口。"""
-    tap(ready, "领取成功")
-    for frame in wait_frames(REWARD_DIALOG_TIMEOUT):
-        offer_visible, unlock = read_tomorrow_offer(frame)
-        if allow_tomorrow and unlock:
-            return False, unlock
-        if offer_visible:
-            continue
-        button = frame.find(CLAIM_BUTTON, DIALOG)
-        if button:
-            tap(button, "领取奖励")
-            break
+    if ready:
+        tap(ready, "领取成功")
+        for frame in wait_frames(REWARD_DIALOG_TIMEOUT):
+            offer_visible, unlock = read_tomorrow_offer(frame)
+            if allow_tomorrow and unlock:
+                return False, unlock
+            if offer_visible:
+                continue
+            button = frame.find(CLAIM_BUTTON, DIALOG)
+            if button:
+                break
+        else:
+            raise StopRun("点了「领取成功」后未找到「领取奖励」。")
     else:
-        raise StopRun("点了「领取成功」后未找到「领取奖励」。")
+        log("已识别到打开的领取奖励弹窗。")
+    tap(button, "领取奖励")
 
     # OCR 没读到旧按钮时，仍需要下一条广告或领取结果来确认页面变化。
     for frame in wait_frames(TRANSITION_TIMEOUT):
@@ -243,16 +280,17 @@ def main():
     completed = 0
     tomorrow_clicked = False
     try:
+        log("汽水音乐安卓脚本已启动。")
         open_player()
-        log(f"请手动打开第一条奖励广告，或回到「明日畅听」弹窗，等待上限 {FIRST_AD_TIMEOUT} 秒。")
+        log(f"请保持汽水音乐在前台。当前广告、领取弹窗和明日畅听弹窗均可继续，首次等待上限 {FIRST_AD_TIMEOUT} 秒。")
         timeout = FIRST_AD_TIMEOUT
         while completed < MAX_ROUNDS:
             allow_tomorrow = not tomorrow_clicked
-            ready, unlock = wait_for_claim(timeout, allow_tomorrow)
-            if not ready and not unlock:
+            ready, unlock, button = wait_for_claim(timeout, allow_tomorrow)
+            if not ready and not unlock and not button:
                 raise StopRun(f"{timeout} 秒内未识别到可领取状态，结束运行。")
-            if ready:
-                claimed, unlock = claim_reward(ready, allow_tomorrow)
+            if ready or button:
+                claimed, unlock = claim_reward(ready, button, allow_tomorrow)
                 if claimed:
                     completed += 1
                     log(f"已完成第 {completed} 次领取操作。")
