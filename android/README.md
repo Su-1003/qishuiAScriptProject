@@ -1,0 +1,24 @@
+# 汽水音乐 AScript 安卓脚本
+
+脚本在安卓手机上运行。打开汽水音乐后，手动进入第一条奖励广告，脚本等到界面出现「领取成功」再执行两步领取。如果 App 接着打开下一条广告，脚本会继续处理。检测到「更多直播」时，脚本会尝试识别实际的关闭按钮，然后等待领取提示。
+
+## 首次部署
+
+1. 安装 [AScript 安卓版](https://www.ascript.cn/docs/android/download/)，在 App 中选用无障碍模式，按系统提示开启无障碍并允许截屏。
+2. 手机和电脑连同一个 Wi-Fi。打开手机 AScript 的「开发者」，在电脑浏览器打开页面显示的局域网地址，进入 WebIDE 并新建一个安卓工程。可参照 [AScript 官方教程](https://www.ascript.cn/docs/android/guide/first/)。
+3. 打开工程的 `__init__.py`，用本目录 [`__init__.py`](./__init__.py) 的全部内容替换，保存并点击运行。工程生成的其他文件按默认设置保留。
+4. 保持手机竖屏。脚本打开汽水音乐后，在 App 内手动进入第一条奖励广告，例如点「免」后按界面提示开始观看。需要结束时，点 AScript 的停止按钮。
+
+## 运行设置
+
+| 脚本顶部的设置 | 默认值 |
+| --- | --- |
+| `FIRST_AD_TIMEOUT` | 等待手动进入首个广告并识别到领取提示，最多 120 秒 |
+| `NEXT_AD_TIMEOUT` | 后续每轮最多等待 75 秒 |
+| `MAX_ROUNDS` | 每次运行最多执行 50 轮领取 |
+
+脚本只在汽水音乐处于前台时点击识别到的按钮。如果页面外观或按钮文案不同，脚本会在等待超时后停止。日志中的次数表示脚本已完成的领取操作，实际听歌时长以汽水音乐页面为准。
+
+已用模拟界面检查领取流程。Android 实际界面的 OCR、权限和屏幕布局有待真机验证。若停在广告或领取页，可保留该页截图和 AScript 的最后几行日志，用于确认应匹配的按钮。
+
+流程参考 [原 iOS 仓库](https://github.com/wei6718189/qishuiAScriptProject)。安卓包名参照 [小米应用商店](https://app.mi.com/details?id=com.luna.music)，OCR 接口参照 [AScript 安卓文档](https://www.ascript.cn/docs/android/api/screen/ocr/)。
