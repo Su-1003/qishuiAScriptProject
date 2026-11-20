@@ -17,11 +17,15 @@ NEXT_AD_TIMEOUT = 75
 REWARD_DIALOG_TIMEOUT = 15
 TRANSITION_TIMEOUT = 10
 POLL_INTERVAL = 0.8
+LIVE_CLOSE_RETRY_DELAY = 3
+LIVE_CLOSE_ATTEMPTS = 2
 
 TOP = (0, 0, 1, 0.24)
 TOP_RIGHT = (0.48, 0, 1, 0.24)
 CLOSE_CORNER = (0.73, 0, 1, 0.24)
 DIALOG = (0.07, 0.24, 0.93, 0.80)
+TOMORROW_HEADER = (0.07, 0.46, 0.93, 0.66)
+TOMORROW_ACTION = (0.07, 0.73, 0.93, 0.92)
 
 SPLASH_SKIP = r"(?:\d+[秒sS]?)?跳过(?:广告)?(?:\d+[秒sS]?)?"
 COUNTDOWN = (
@@ -30,7 +34,11 @@ COUNTDOWN = (
 )
 CLAIM_READY = r"领取成功[×✕✖Xx]?"
 CLAIM_BUTTON = r"领取奖励"
+LIVE_ROOM = r"更多直播"
 LIVE_CLOSE = r"(?:关闭(?:直播(?:间)?)?|退出直播(?:间)?|[×✕✖Xx])"
+TODAY_CLAIMED = r"恭喜获得今日免费时长畅听"
+TOMORROW_PROMPT = rf"(?:再看[1１一]个提前享明日畅听|{TODAY_CLAIMED})"
+TOMORROW_BUTTON = r"立即解锁明日畅听"
 
 
 class StopRun(Exception):
@@ -121,34 +129,95 @@ def find_live_close(frame):
     return frame.find(LIVE_CLOSE, CLOSE_CORNER)
 
 
-def wait_for_claim(timeout):
-    live_closed = False
+def find_resume_button(frame):
+    if frame.find(r"(?:坚持退出|确认退出|放弃奖励)", DIALOG):
+        return frame.find(r"继续观看", DIALOG)
+    return None
+
+
+def ad_in_progress(frame):
+    return bool(
+        frame.find(COUNTDOWN, TOP)
+        or frame.find(LIVE_ROOM, TOP_RIGHT)
+        or find_resume_button(frame)
+    )
+
+
+def find_tomorrow_button(frame):
+    button = frame.find(TOMORROW_BUTTON, TOMORROW_ACTION)
+    if button:
+        return button
+
+    # OCR 有时会把同一按钮的两段文字分开返回。
+    unlock = frame.find(r"立即解锁", (0.07, 0.73, 0.50, 0.92))
+    tomorrow = frame.find(r"明日畅听", (0.50, 0.73, 0.93, 0.92))
+    if unlock and tomorrow and abs(unlock[1] - tomorrow[1]) <= frame.height * 0.025:
+        return unlock
+    return None
+
+
+def read_tomorrow_offer(frame):
+    """返回是否看到弹窗内容，以及证据齐全时的按钮坐标。"""
+    heading = frame.find(TOMORROW_PROMPT, TOMORROW_HEADER)
+    button = find_tomorrow_button(frame)
+    return bool(heading or button), button if heading else None
+
+
+def open_tomorrow_ad(point):
+    tap(point, "立即解锁 明日畅听")
+    for frame in wait_frames(TRANSITION_TIMEOUT):
+        offer_visible, _ = read_tomorrow_offer(frame)
+        if not offer_visible and ad_in_progress(frame):
+            log("已识别到明日畅听广告界面。")
+            return
+    raise StopRun("已点击「立即解锁 明日畅听」，等待广告打开超时。")
+
+
+def wait_for_claim(timeout, allow_tomorrow):
+    live_close_attempts = 0
+    next_live_close_at = 0
     continue_clicked = False
     for frame in wait_frames(timeout):
-        resume = frame.find(r"继续观看", DIALOG)
-        exit_prompt = frame.find(r"(?:坚持退出|确认退出|放弃奖励)", DIALOG)
-        if resume and exit_prompt and not continue_clicked:
-            tap(resume, "继续观看")
-            continue_clicked = True
+        resume = find_resume_button(frame)
+        if resume:
+            if not continue_clicked:
+                tap(resume, "继续观看")
+                continue_clicked = True
             continue
 
         if frame.find(COUNTDOWN, TOP):
             continue
+        offer_visible, unlock = read_tomorrow_offer(frame)
+        if allow_tomorrow and unlock:
+            return None, unlock
+        if offer_visible:
+            continue
         ready = frame.find(CLAIM_READY, TOP_RIGHT)
         if ready:
-            return ready
+            return ready, None
 
-        if not live_closed and frame.find(r"更多直播", TOP_RIGHT):
-            close = find_live_close(frame)
-            if close:
-                tap(close, "关闭直播间")
-                live_closed = True
-    return None
+        if time.monotonic() < next_live_close_at or not frame.find(LIVE_ROOM, TOP_RIGHT):
+            continue
+        if live_close_attempts >= LIVE_CLOSE_ATTEMPTS:
+            raise StopRun("已尝试点击两次关闭按钮，仍识别到直播间。")
+        close = find_live_close(frame)
+        if close:
+            label = "重试关闭直播间" if live_close_attempts else "关闭直播间"
+            tap(close, label)
+            live_close_attempts += 1
+            next_live_close_at = time.monotonic() + LIVE_CLOSE_RETRY_DELAY
+    return None, None
 
 
-def claim_reward(ready):
+def claim_reward(ready, allow_tomorrow):
+    """返回本轮是否完成常规领取，以及是否出现明日畅听入口。"""
     tap(ready, "领取成功")
     for frame in wait_frames(REWARD_DIALOG_TIMEOUT):
+        offer_visible, unlock = read_tomorrow_offer(frame)
+        if allow_tomorrow and unlock:
+            return False, unlock
+        if offer_visible:
+            continue
         button = frame.find(CLAIM_BUTTON, DIALOG)
         if button:
             tap(button, "领取奖励")
@@ -156,31 +225,41 @@ def claim_reward(ready):
     else:
         raise StopRun("点了「领取成功」后未找到「领取奖励」。")
 
-    # 等待旧领取界面退出，避免把残留按钮当作下一轮。
-    clear_frames = 0
+    # OCR 没读到旧按钮时，仍需要下一条广告或领取结果来确认页面变化。
     for frame in wait_frames(TRANSITION_TIMEOUT):
+        offer_visible, unlock = read_tomorrow_offer(frame)
+        if allow_tomorrow and unlock:
+            return True, unlock
         if frame.find(CLAIM_BUTTON, DIALOG) or frame.find(CLAIM_READY, TOP_RIGHT):
-            clear_frames = 0
             continue
-        clear_frames += 1
-        if clear_frames >= 2 or frame.find(COUNTDOWN, TOP):
-            return
-    raise StopRun("点击领取后界面未切换，本次领取结果需在汽水音乐中确认。")
+        if frame.find(TODAY_CLAIMED, TOMORROW_HEADER) or (
+            not offer_visible and ad_in_progress(frame)
+        ):
+            return True, None
+    raise StopRun("已点击「领取奖励」，未识别到下一条广告或领取结果，请在汽水音乐中确认。")
 
 
 def main():
     completed = 0
+    tomorrow_clicked = False
     try:
         open_player()
-        log(f"请手动打开第一条奖励广告，等待上限 {FIRST_AD_TIMEOUT} 秒。")
-        for index in range(MAX_ROUNDS):
-            timeout = FIRST_AD_TIMEOUT if index == 0 else NEXT_AD_TIMEOUT
-            ready = wait_for_claim(timeout)
-            if not ready:
+        log(f"请手动打开第一条奖励广告，或回到「明日畅听」弹窗，等待上限 {FIRST_AD_TIMEOUT} 秒。")
+        timeout = FIRST_AD_TIMEOUT
+        while completed < MAX_ROUNDS:
+            allow_tomorrow = not tomorrow_clicked
+            ready, unlock = wait_for_claim(timeout, allow_tomorrow)
+            if not ready and not unlock:
                 raise StopRun(f"{timeout} 秒内未识别到可领取状态，结束运行。")
-            claim_reward(ready)
-            completed += 1
-            log(f"已完成第 {completed} 次领取操作。")
+            if ready:
+                claimed, unlock = claim_reward(ready, allow_tomorrow)
+                if claimed:
+                    completed += 1
+                    log(f"已完成第 {completed} 次领取操作。")
+            if unlock and completed < MAX_ROUNDS:
+                open_tomorrow_ad(unlock)
+                tomorrow_clicked = True
+            timeout = NEXT_AD_TIMEOUT
         log(f"已达到本次设置的 {MAX_ROUNDS} 轮上限。")
     except StopRun as error:
         log(str(error))
